@@ -66,10 +66,14 @@ pub enum Op {
     Relu(Tensor),
     Sum(Tensor),
     Pow(Tensor, f32),   // 次方
+    Sigmoid(Tensor),    // Sigmoid
+    Tanh(Tensor),       // Tanh
+    Lerp(Tensor, Tensor, Tensor), // a + (b - a) * gate
     Log(Tensor),        // 對數
     Softmax(Tensor),    // Softmax
     LogSoftmax(Tensor), // Log-Softmax
     LogSumExp(Tensor),  // LogSumExp
+    Embedding(Tensor, Vec<usize>, usize, usize), // weight, ids, batch, time
     Reshape(Tensor),
     Transpose(Tensor),
     Permute(Tensor, Vec<usize>),
@@ -112,6 +116,22 @@ impl Tensor {
     pub fn grad(&self) -> Vec<f32> { self.0.borrow().grad.to_vec() }
     pub fn shape(&self) -> Vec<usize> { self.0.borrow().shape.clone() }
     pub fn device(&self) -> Device { self.0.borrow().device }
+
+    pub fn set_data(&self, data: &[f32]) {
+        let mut inner = self.0.borrow_mut();
+        if data.len() != inner.data.length() {
+            panic!("set_data: length mismatch");
+        }
+        inner.data = Storage::new(data, inner.device);
+    }
+
+    pub fn set_grad(&self, grad: &[f32]) {
+        let mut inner = self.0.borrow_mut();
+        if grad.len() != inner.grad.length() {
+            panic!("set_grad: length mismatch");
+        }
+        inner.grad = Storage::new(grad, inner.device);
+    }
 
     /// 在預設裝置上產生標準常態分佈隨機張量
     pub fn randn(shape: &[usize]) -> Self {
@@ -177,6 +197,12 @@ impl Tensor {
         })))
     }
 
+    pub fn mul_scalar(&self, s: f32) -> Tensor {
+        let len = self.0.borrow().data.length();
+        let scalar = Tensor::new_on(&vec![s; len], &self.shape(), self.device());
+        self.mul(&scalar)
+    }
+
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         let m = self.shape()[0];
         let k = self.shape()[1];
@@ -194,6 +220,47 @@ impl Tensor {
             data: storage, grad: Storage::zeros(self.0.borrow().data.length(), self.device()),
             shape: self.shape(), op: Op::Relu(self.clone()), device: self.device()
         })))
+    }
+
+    pub fn sigmoid(&self) -> Tensor {
+        let data = self.data();
+        let mut out = Vec::with_capacity(data.len());
+        for v in data {
+            out.push(1.0 / (1.0 + (-v).exp()));
+        }
+        let storage = Storage::new(&out, self.device());
+        Self(Rc::new(RefCell::new(TensorInner {
+            data: storage,
+            grad: Storage::zeros(out.len(), self.device()),
+            shape: self.shape(),
+            op: Op::Sigmoid(self.clone()),
+            device: self.device(),
+        })))
+    }
+
+    pub fn tanh(&self) -> Tensor {
+        let data = self.data();
+        let mut out = Vec::with_capacity(data.len());
+        for v in data {
+            out.push(v.tanh());
+        }
+        let storage = Storage::new(&out, self.device());
+        Self(Rc::new(RefCell::new(TensorInner {
+            data: storage,
+            grad: Storage::zeros(out.len(), self.device()),
+            shape: self.shape(),
+            op: Op::Tanh(self.clone()),
+            device: self.device(),
+        })))
+    }
+
+    pub fn lerp(&self, other: &Tensor, gate: &Tensor) -> Tensor {
+        let diff = other.sub(self);
+        let out = self.add(&diff.mul(gate));
+        let mut inner = out.0.borrow_mut();
+        inner.op = Op::Lerp(self.clone(), other.clone(), gate.clone());
+        drop(inner);
+        out
     }
 
     pub fn sum(&self) -> Tensor {
@@ -478,8 +545,9 @@ impl Tensor {
                 visited.insert(v.clone());
                 match &v.0.borrow().op {
                     Op::Add(a, b) | Op::Mul(a, b) | Op::Matmul(a, b) | Op::AddBroadcast(a, b) => { build_topo(a, visited, topo); build_topo(b, visited, topo); }
-                    Op::Relu(a) | Op::Sum(a) | Op::Pow(a, _) | Op::Log(a) | Op::Softmax(a) | Op::LogSoftmax(a) | Op::LogSumExp(a)
+                    Op::Relu(a) | Op::Sigmoid(a) | Op::Tanh(a) | Op::Sum(a) | Op::Pow(a, _) | Op::Log(a) | Op::Softmax(a) | Op::LogSoftmax(a) | Op::LogSumExp(a) | Op::Embedding(a, _, _, _) | Op::Lerp(a, _, _)
                     | Op::Reshape(a) | Op::Transpose(a) | Op::Permute(a, _) | Op::Slice(a, _, _) | Op::Max(a, _) => { build_topo(a, visited, topo); }
+                    Op::Lerp(a, b, g) => { build_topo(a, visited, topo); build_topo(b, visited, topo); build_topo(g, visited, topo); }
                     Op::Concat(a, b, _) => { build_topo(a, visited, topo); build_topo(b, visited, topo); }
                     Op::Leaf => {}
                 }
@@ -523,6 +591,44 @@ impl Tensor {
                 Op::Relu(a) => {
                     let tmp = a.0.borrow().data.relu_bw(&grad);
                     a.0.borrow_mut().grad.add_assign(&tmp);
+                }
+                Op::Sigmoid(a) => {
+                    let sig = inner.data.to_vec();
+                    let grad_out = grad.to_vec();
+                    let mut grad_in = vec![0.0f32; sig.len()];
+                    for i in 0..sig.len() {
+                        grad_in[i] = sig[i] * (1.0 - sig[i]) * grad_out[i];
+                    }
+                    let grad_storage = Storage::new(&grad_in, a.device());
+                    a.0.borrow_mut().grad.add_assign(&grad_storage);
+                }
+                Op::Tanh(a) => {
+                    let t = inner.data.to_vec();
+                    let grad_out = grad.to_vec();
+                    let mut grad_in = vec![0.0f32; t.len()];
+                    for i in 0..t.len() {
+                        grad_in[i] = (1.0 - t[i] * t[i]) * grad_out[i];
+                    }
+                    let grad_storage = Storage::new(&grad_in, a.device());
+                    a.0.borrow_mut().grad.add_assign(&grad_storage);
+                }
+                Op::Lerp(a, b, g) => {
+                    let gate = g.data();
+                    let grad_out = grad.to_vec();
+                    let mut grad_a = vec![0.0f32; grad_out.len()];
+                    let mut grad_b = vec![0.0f32; grad_out.len()];
+                    let mut grad_g = vec![0.0f32; grad_out.len()];
+                    for i in 0..grad_out.len() {
+                        grad_a[i] = grad_out[i] * (1.0 - gate[i]);
+                        grad_b[i] = grad_out[i] * gate[i];
+                        grad_g[i] = grad_out[i] * (b.data()[i] - a.data()[i]);
+                    }
+                    let ga = Storage::new(&grad_a, a.device());
+                    let gb = Storage::new(&grad_b, b.device());
+                    let gg = Storage::new(&grad_g, g.device());
+                    a.0.borrow_mut().grad.add_assign(&ga);
+                    b.0.borrow_mut().grad.add_assign(&gb);
+                    g.0.borrow_mut().grad.add_assign(&gg);
                 }
                 Op::Sum(a) => {
                     let tmp = a.0.borrow().data.sum_bw(&grad);
@@ -571,6 +677,23 @@ impl Tensor {
 
                     let grad_storage = Storage::new(&grad_in, a.device());
                     a.0.borrow_mut().grad.add_assign(&grad_storage);
+                }
+                Op::Embedding(weight, ids, batch, time) => {
+                    let dim = weight.shape()[1];
+                    let grad_out = grad.to_vec();
+                    let mut grad_w = vec![0.0f32; weight.0.borrow().data.length()];
+                    for b in 0..*batch {
+                        for t in 0..*time {
+                            let id = ids[b * *time + t];
+                            let w_off = id * dim;
+                            let g_off = (b * *time + t) * dim;
+                            for d in 0..dim {
+                                grad_w[w_off + d] += grad_out[g_off + d];
+                            }
+                        }
+                    }
+                    let grad_storage = Storage::new(&grad_w, weight.device());
+                    weight.0.borrow_mut().grad.add_assign(&grad_storage);
                 }
                 Op::Reshape(a) => {
                     a.0.borrow_mut().grad.add_assign(&grad);

@@ -3,12 +3,15 @@ mod tensor;
 mod nn;
 mod optimizer;
 mod dataset;
+mod text;
 
 use backend::Device;
 use tensor::Tensor;
 use nn::Linear;
-use optimizer::SGD;
+use nn::{RNN, GRU};
+use optimizer::{SGD, Adam};
 use dataset::{DataLoader, make_spiral, make_blobs};
+use text::{CharVocab, CharDataset, CharDataLoader};
 
 fn gradcheck_log_softmax(device: Device) {
     println!("\n=== gradcheck: log_softmax on {:?} ===", device);
@@ -157,6 +160,35 @@ fn main() {
         "blob" => {
             demo_blob_boundary(Device::Cpu);
         }
+        "char" => {
+            let device_arg = std::env::args().nth(2).unwrap_or_else(|| "cpu".to_string());
+            let model_arg = std::env::args().nth(3).unwrap_or_else(|| "rnn".to_string());
+            let epochs_arg = std::env::args().nth(4);
+            let device = match device_arg.as_str() {
+                "cpu" | "CPU" => Some(Device::Cpu),
+                "gpu" | "GPU" => {
+                    #[cfg(target_os = "macos")]
+                    { Some(Device::MacMetal) }
+                    #[cfg(not(target_os = "macos"))]
+                    { None }
+                }
+                _ => None,
+            };
+            if device.is_none() {
+                println!("Usage: cargo run --release -- char [cpu|gpu] [rnn|gru|gpt] [epochs]");
+                return;
+            }
+            let device = device.unwrap();
+            let epochs = epochs_arg
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(80);
+            match model_arg.as_str() {
+                "rnn" | "RNN" => demo_char_pipeline(device, "rnn", epochs),
+                "gru" | "GRU" => demo_char_pipeline(device, "gru", epochs),
+                "gpt" | "GPT" => demo_char_gpt(device),
+                _ => println!("Usage: cargo run --release -- char [cpu|gpu] [rnn|gru|gpt] [epochs]"),
+            }
+        }
         "all" => {
             #[cfg(target_os = "macos")]
             {
@@ -169,11 +201,350 @@ fn main() {
             train_xor(Device::Cpu);
             demo_spiral_boundary(Device::Cpu);
             demo_blob_boundary(Device::Cpu);
+            demo_char_pipeline(Device::Cpu, "rnn", 80);
         }
         _ => {
-            println!("Usage: cargo run --release -- [xor|spiral|blob|all]");
+            println!("Usage: cargo run --release -- [xor|spiral|blob|char|all]");
         }
     }
+}
+
+fn demo_char_pipeline(device: Device, kind: &str, epochs: usize) {
+    println!("\n=== char pipeline demo on {:?} ===", device);
+    let text = std::fs::read_to_string("data/exp.txt").expect("failed to read data/exp.txt");
+    let vocab = CharVocab::new_from_text(&text);
+    let ids = vocab.encode(&text);
+    let block_size = 30;
+    let batch_size = 20;
+    let cols = ids.len() / batch_size;
+    let ids = ids[..batch_size * cols].to_vec();
+
+    let vocab_size = vocab.len();
+    let emb_dim = 32;
+    let hidden = 128;
+    let emb = nn::Embedding::new_on(vocab_size, emb_dim, device);
+    let model = if matches!(kind, "gru" | "GRU") {
+        CharModel::Gru(GRU::new_on(emb_dim, hidden, device))
+    } else {
+        CharModel::Rnn(RNN::new_on(emb_dim, hidden, device))
+    };
+    let proj = nn::Linear::new_on(hidden, vocab_size, device);
+    let mut params = Vec::new();
+    params.extend(emb.parameters());
+    params.extend(model.parameters());
+    params.extend(proj.parameters());
+    let mut opt = Adam::new(params.clone(), 0.01, 0.9, 0.999, 1e-8);
+
+    let mut h = Tensor::new_on(&vec![0.0; batch_size * hidden], &[batch_size, hidden], device);
+    for epoch in 1..=epochs {
+        let mut epoch_loss = 0.0f32;
+        let mut tokens = 0usize;
+        let steps = (cols - 1) / block_size;
+        for s in 0..steps {
+            let start = s * block_size;
+            let end = start + block_size;
+            let mut xb = Vec::with_capacity(batch_size * block_size);
+            let mut yb = Vec::with_capacity(batch_size * block_size);
+            for b in 0..batch_size {
+                let base = b * cols;
+                xb.extend_from_slice(&ids[base + start..base + end]);
+                yb.extend_from_slice(&ids[base + start + 1..base + end + 1]);
+            }
+
+            let x_emb = emb.forward_ids(&xb, batch_size, block_size);
+            let y_one_hot = one_hot_targets(&yb, vocab_size, device);
+            let (h_seq, h_last) = model.forward_with_state(&x_emb, &h);
+            let logits = h_seq.reshape(&[batch_size * block_size, hidden]);
+            let out = proj.forward(&logits);
+            let loss = out.nll_loss(&y_one_hot);
+
+            opt.zero_grad();
+            loss.backward();
+            clip_grad_norm(&params, 0.5);
+            opt.step();
+
+            h = Tensor::new_on(&h_last.data(), &[batch_size, hidden], device);
+            epoch_loss += loss.data()[0];
+            tokens += batch_size * block_size;
+        }
+        let avg_loss = if tokens > 0 { epoch_loss / tokens as f32 } else { 0.0 };
+        println!("epoch {:03} | loss {:.4}", epoch, avg_loss);
+    }
+
+    let prompt = "2+3";
+    let generated = generate_text(prompt, 40, &vocab, &emb, &model, &proj, device);
+    println!("prompt: {}", prompt);
+    println!("sample: {}", generated);
+}
+
+fn one_hot_targets(ids: &[usize], vocab: usize, device: Device) -> Tensor {
+    let mut data = vec![0.0f32; ids.len() * vocab];
+    for (i, &id) in ids.iter().enumerate() {
+        data[i * vocab + id] = 1.0;
+    }
+    Tensor::new_on(&data, &[ids.len(), vocab], device)
+}
+
+fn generate_text(prompt: &str, max_new: usize, vocab: &CharVocab, emb: &nn::Embedding, model: &CharModel, proj: &nn::Linear, device: Device) -> String {
+    let mut ids = vocab.encode_lossy(prompt);
+    let hidden = model.hidden_size();
+    let emb_dim = emb.weight.shape()[1];
+    let mut h = Tensor::new_on(&vec![0.0; hidden], &[1, hidden], device);
+
+    // Prime with prompt
+    for &id in &ids {
+        let x = emb.forward_ids(&[id], 1, 1).reshape(&[1, emb_dim]);
+        h = model.step(&x, &h);
+    }
+
+    for _ in 0..max_new {
+        let logits = proj.forward(&h);
+        let probs = logits.softmax().data();
+        let mut best = 0usize;
+        let mut best_val = probs[0];
+        for i in 1..probs.len() {
+            if probs[i] > best_val {
+                best_val = probs[i];
+                best = i;
+            }
+        }
+        ids.push(best);
+        let x = emb.forward_ids(&[best], 1, 1).reshape(&[1, emb_dim]);
+        h = model.step(&x, &h);
+    }
+    vocab.decode(&ids)
+}
+
+enum CharModel {
+    Rnn(RNN),
+    Gru(GRU),
+}
+
+impl CharModel {
+    fn parameters(&self) -> Vec<Tensor> {
+        match self {
+            CharModel::Rnn(r) => r.parameters(),
+            CharModel::Gru(g) => g.parameters(),
+        }
+    }
+
+    fn hidden_size(&self) -> usize {
+        match self {
+            CharModel::Rnn(r) => r.wh.shape()[0],
+            CharModel::Gru(g) => g.wh_r.shape()[0],
+        }
+    }
+
+    fn forward_with_state(&self, x: &Tensor, h0: &Tensor) -> (Tensor, Tensor) {
+        match self {
+            CharModel::Rnn(r) => r.forward_with_state(x, h0),
+            CharModel::Gru(g) => g.forward_with_state(x, h0),
+        }
+    }
+
+    fn step(&self, x: &Tensor, h_prev: &Tensor) -> Tensor {
+        match self {
+            CharModel::Rnn(r) => r.step(x, h_prev),
+            CharModel::Gru(g) => g.step(x, h_prev),
+        }
+    }
+}
+
+fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
+    let mut total = 0.0f32;
+    for p in params {
+        let g = p.grad();
+        for v in g {
+            total += v * v;
+        }
+    }
+    let norm = total.sqrt();
+    if norm <= max_norm || norm == 0.0 { return; }
+    let scale = max_norm / norm;
+    for p in params {
+        let mut g = p.grad();
+        for v in &mut g {
+            *v *= scale;
+        }
+        p.set_grad(&g);
+    }
+}
+
+fn demo_char_gpt(device: Device) {
+    println!("\n=== char gpt demo on {:?} ===", device);
+    let text = std::fs::read_to_string("data/exp.txt").expect("failed to read data/exp.txt");
+    let vocab = CharVocab::new_from_text(&text);
+    let ids = vocab.encode(&text);
+    let block_size = 16;
+    let dataset = CharDataset::new(ids, block_size);
+    let mut loader = CharDataLoader::new(dataset, 64, true, 123);
+
+    let vocab_size = vocab.len();
+    let emb_dim = 32;
+    let ff_dim = 64;
+    let emb = nn::Embedding::new_on(vocab_size, emb_dim, device);
+    let pos_emb = nn::Embedding::new_on(block_size, emb_dim, device);
+
+    let q_proj = nn::Linear::new_on(emb_dim, emb_dim, device);
+    let k_proj = nn::Linear::new_on(emb_dim, emb_dim, device);
+    let v_proj = nn::Linear::new_on(emb_dim, emb_dim, device);
+    let o_proj = nn::Linear::new_on(emb_dim, emb_dim, device);
+
+    let ff1 = nn::Linear::new_on(emb_dim, ff_dim, device);
+    let ff2 = nn::Linear::new_on(ff_dim, emb_dim, device);
+
+    let head = nn::Linear::new_on(emb_dim, vocab_size, device);
+
+    let mut params = Vec::new();
+    params.extend(emb.parameters());
+    params.extend(pos_emb.parameters());
+    params.extend(q_proj.parameters());
+    params.extend(k_proj.parameters());
+    params.extend(v_proj.parameters());
+    params.extend(o_proj.parameters());
+    params.extend(ff1.parameters());
+    params.extend(ff2.parameters());
+    params.extend(head.parameters());
+    let mut opt = Adam::new(params, 0.01, 0.9, 0.999, 1e-8);
+
+    let epochs = 20;
+    for epoch in 1..=epochs {
+        loader.reset();
+        let mut epoch_loss = 0.0f32;
+        let mut tokens = 0usize;
+        while let Some((xb, yb, batch, time)) = loader.next_batch() {
+            let x_tok = emb.forward_ids(&xb, batch, time);
+            let pos_ids = position_ids(batch, time);
+            let x_pos = pos_emb.forward_ids(&pos_ids, batch, time);
+            let x = x_tok.add(&x_pos);
+
+            let q = q_proj.forward(&x.reshape(&[batch * time, emb_dim])).reshape(&[batch, time, emb_dim]);
+            let k = k_proj.forward(&x.reshape(&[batch * time, emb_dim])).reshape(&[batch, time, emb_dim]);
+            let v = v_proj.forward(&x.reshape(&[batch * time, emb_dim])).reshape(&[batch, time, emb_dim]);
+
+            let attn = causal_attention(&q, &k, &v, time, device);
+            let attn_out = o_proj.forward(&attn.reshape(&[batch * time, emb_dim])).reshape(&[batch, time, emb_dim]);
+
+            let ff = ff2.forward(&ff1.forward(&attn_out.reshape(&[batch * time, emb_dim])).relu());
+            let ff_out = ff.reshape(&[batch, time, emb_dim]);
+
+            let logits = head.forward(&ff_out.reshape(&[batch * time, emb_dim]));
+            let y_one_hot = one_hot_targets(&yb, vocab_size, device);
+            let loss = logits.nll_loss(&y_one_hot);
+
+            opt.zero_grad();
+            loss.backward();
+            opt.step();
+
+            epoch_loss += loss.data()[0];
+            tokens += batch * time;
+        }
+        let avg_loss = if tokens > 0 { epoch_loss / tokens as f32 } else { 0.0 };
+        println!("epoch {:03} | loss {:.4}", epoch, avg_loss);
+    }
+
+    let prompt = "2+3";
+    let generated = generate_gpt(prompt, 40, &vocab, &emb, &pos_emb, &q_proj, &k_proj, &v_proj, &o_proj, &ff1, &ff2, &head, block_size, device);
+    println!("prompt: {}", prompt);
+    println!("sample: {}", generated);
+}
+
+fn position_ids(batch: usize, time: usize) -> Vec<usize> {
+    let mut ids = Vec::with_capacity(batch * time);
+    for _ in 0..batch {
+        for t in 0..time {
+            ids.push(t);
+        }
+    }
+    ids
+}
+
+fn causal_mask(time: usize, device: Device) -> Tensor {
+    let mut data = vec![0.0f32; time * time];
+    for i in 0..time {
+        for j in (i + 1)..time {
+            data[i * time + j] = -1e9;
+        }
+    }
+    Tensor::new_on(&data, &[time, time], device)
+}
+
+fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, time: usize, device: Device) -> Tensor {
+    let shape = q.shape();
+    let batch = shape[0];
+    let dim = shape[2];
+    let scale = 1.0f32 / (dim as f32).sqrt();
+    let mask = causal_mask(time, device);
+
+    let q2d = q.reshape(&[batch * time, dim]);
+    let k2d = k.reshape(&[batch * time, dim]);
+    let v2d = v.reshape(&[batch * time, dim]);
+
+    let mut out: Option<Tensor> = None;
+    for b in 0..batch {
+        let q_b = q2d.slice(b * time, (b + 1) * time).reshape(&[time, dim]);
+        let k_b = k2d.slice(b * time, (b + 1) * time).reshape(&[time, dim]);
+        let v_b = v2d.slice(b * time, (b + 1) * time).reshape(&[time, dim]);
+        let scores = q_b.matmul(&k_b.transpose()).mul_scalar(scale).add(&mask);
+        let attn = scores.softmax();
+        let out_b = attn.matmul(&v_b); // [time, dim]
+        out = Some(match out {
+            None => out_b,
+            Some(acc) => acc.concat(&out_b, 0),
+        });
+    }
+    out.unwrap().reshape(&[batch, time, dim])
+}
+
+fn generate_gpt(
+    prompt: &str,
+    max_new: usize,
+    vocab: &CharVocab,
+    emb: &nn::Embedding,
+    pos_emb: &nn::Embedding,
+    q_proj: &nn::Linear,
+    k_proj: &nn::Linear,
+    v_proj: &nn::Linear,
+    o_proj: &nn::Linear,
+    ff1: &nn::Linear,
+    ff2: &nn::Linear,
+    head: &nn::Linear,
+    block_size: usize,
+    device: Device,
+) -> String {
+    let mut ids = vocab.encode_lossy(prompt);
+    for _ in 0..max_new {
+        let start = if ids.len() > block_size { ids.len() - block_size } else { 0 };
+        let window = &ids[start..];
+        let time = window.len();
+        let x_tok = emb.forward_ids(window, 1, time);
+        let pos_ids = (0..time).collect::<Vec<_>>();
+        let x_pos = pos_emb.forward_ids(&pos_ids, 1, time);
+        let x = x_tok.add(&x_pos);
+
+        let q = q_proj.forward(&x.reshape(&[time, emb.weight.shape()[1]])).reshape(&[1, time, emb.weight.shape()[1]]);
+        let k = k_proj.forward(&x.reshape(&[time, emb.weight.shape()[1]])).reshape(&[1, time, emb.weight.shape()[1]]);
+        let v = v_proj.forward(&x.reshape(&[time, emb.weight.shape()[1]])).reshape(&[1, time, emb.weight.shape()[1]]);
+
+        let attn = causal_attention(&q, &k, &v, time, device);
+        let attn_out = o_proj.forward(&attn.reshape(&[time, emb.weight.shape()[1]])).reshape(&[1, time, emb.weight.shape()[1]]);
+        let ff = ff2.forward(&ff1.forward(&attn_out.reshape(&[time, emb.weight.shape()[1]])).relu());
+        let ff_out = ff.reshape(&[1, time, emb.weight.shape()[1]]);
+
+        let logits = head.forward(&ff_out.reshape(&[time, emb.weight.shape()[1]]));
+        let probs = logits.softmax().data();
+        let mut best = 0usize;
+        let mut best_val = probs[(time - 1) * vocab.len()];
+        for i in 0..vocab.len() {
+            let v = probs[(time - 1) * vocab.len() + i];
+            if v > best_val {
+                best_val = v;
+                best = i;
+            }
+        }
+        ids.push(best);
+    }
+    vocab.decode(&ids)
 }
 
 fn demo_spiral_boundary(device: Device) {
@@ -265,7 +636,7 @@ fn demo_blob_boundary(device: Device) {
     let mut params = Vec::new();
     params.extend(layer1.parameters());
     params.extend(layer2.parameters());
-    let opt = SGD::new(params, 0.05);
+    let mut opt = Adam::new(params, 0.01, 0.9, 0.999, 1e-8);
 
     let epochs = 400;
     for epoch in 1..=epochs {

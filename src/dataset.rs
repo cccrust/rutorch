@@ -1,5 +1,5 @@
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Normal, Distribution};
 
