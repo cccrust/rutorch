@@ -1,0 +1,11 @@
+[package]
+name = "rutorch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+metal = "0.29.0"
+lazy_static = "1.4.0"
+rand = "0.8.5"
+rand_distr = "0.4.3"
+cfg-if = "1.0.4"
