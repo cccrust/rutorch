@@ -34,31 +34,29 @@ impl Linear {
     }
 }
 
-// ==========================================
-// 2. 隨機梯度下降優化器 (SGD Optimizer)
-// ==========================================
-pub struct SGD {
-    params: Vec<Tensor>,
-    lr: f32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::Tensor;
+    use crate::backend::Device;
 
-impl SGD {
-    /// 將所有需要訓練的參數收集起來
-    pub fn new(params: Vec<Tensor>, lr: f32) -> Self {
-        Self { params, lr }
+    #[test]
+    fn linear_forward_shapes() {
+        let layer = Linear::new_on(3, 2, Device::Cpu);
+        let x = Tensor::new_on(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::Cpu);
+        let y = layer.forward(&x);
+        assert_eq!(y.shape(), vec![2, 2]);
     }
 
-    /// 一鍵清空所有參數的梯度
-    pub fn zero_grad(&self) {
-        for p in &self.params {
-            p.zero_grad();
-        }
+    #[test]
+    fn linear_backward_grad_shapes() {
+        let layer = Linear::new_on(3, 2, Device::Cpu);
+        let x = Tensor::new_on(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], Device::Cpu);
+        let y = layer.forward(&x).sum();
+        y.backward();
+        assert_eq!(layer.weight.grad().len(), 6);
+        assert_eq!(layer.bias.grad().len(), 2);
+        assert_eq!(x.grad().len(), 6);
     }
 
-    /// 一鍵更新所有參數
-    pub fn step(&self) {
-        for p in &self.params {
-            p.step(self.lr);
-        }
-    }
 }

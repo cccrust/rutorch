@@ -1,10 +1,14 @@
 mod backend;
 mod tensor;
 mod nn;
+mod optimizer;
+mod dataset;
 
 use backend::Device;
 use tensor::Tensor;
-use nn::{Linear, SGD};
+use nn::Linear;
+use optimizer::SGD;
+use dataset::{DataLoader, make_spiral, make_blobs};
 
 fn gradcheck_log_softmax(device: Device) {
     println!("\n=== gradcheck: log_softmax on {:?} ===", device);
@@ -61,6 +65,12 @@ fn demo_stability(device: Device) {
 
     println!("naive (softmax->log): {:.6}", naive);
     println!("stable (log_softmax): {:.6}", stable);
+
+    let sm = logits.softmax().data();
+    let lsm = logits.log_softmax().data();
+    println!("logits row0: {:?}", &logits.data()[0..3]);
+    println!("softmax row0: {:?}", &sm[0..3]);
+    println!("log_softmax row0: {:?}", &lsm[0..3]);
 }
 
 fn train_xor(device: Device) {
@@ -126,17 +136,242 @@ fn train_xor(device: Device) {
 
 fn main() {
     println!("=== Rutorch Backend 測試 ===");
-    
-    #[cfg(target_os = "macos")]
-    {
-        gradcheck_log_softmax(Device::MacMetal);
-        demo_stability(Device::MacMetal);
-        train_xor(Device::MacMetal);
+
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "xor".to_string());
+    match arg.as_str() {
+        "xor" => {
+            #[cfg(target_os = "macos")]
+            {
+                gradcheck_log_softmax(Device::MacMetal);
+                demo_stability(Device::MacMetal);
+                train_xor(Device::MacMetal);
+            }
+            gradcheck_log_softmax(Device::Cpu);
+            demo_stability(Device::Cpu);
+            train_xor(Device::Cpu);
+            // train_xor(Device::Cuda); // 目前是佔位符
+        }
+        "spiral" => {
+            demo_spiral_boundary(Device::Cpu);
+        }
+        "blob" => {
+            demo_blob_boundary(Device::Cpu);
+        }
+        "all" => {
+            #[cfg(target_os = "macos")]
+            {
+                gradcheck_log_softmax(Device::MacMetal);
+                demo_stability(Device::MacMetal);
+                train_xor(Device::MacMetal);
+            }
+            gradcheck_log_softmax(Device::Cpu);
+            demo_stability(Device::Cpu);
+            train_xor(Device::Cpu);
+            demo_spiral_boundary(Device::Cpu);
+            demo_blob_boundary(Device::Cpu);
+        }
+        _ => {
+            println!("Usage: cargo run --release -- [xor|spiral|blob|all]");
+        }
+    }
+}
+
+fn demo_spiral_boundary(device: Device) {
+    use std::fs::{create_dir_all, File};
+    use std::io::Write;
+
+    println!("\n=== spiral demo on {:?} ===", device);
+    let ds = make_spiral(300, 0.05, 4.0, 42);
+    let mut loader = DataLoader::new(ds.clone(), 32, true, 7);
+
+    let layer1 = Linear::new_on(2, 128, device);
+    let layer2 = Linear::new_on(128, 128, device);
+    let layer3 = Linear::new_on(128, 2, device);
+    let mut params = Vec::new();
+    params.extend(layer1.parameters());
+    params.extend(layer2.parameters());
+    params.extend(layer3.parameters());
+    let opt = SGD::new(params, 0.03);
+
+    let epochs = 3000;
+    for epoch in 1..=epochs {
+        loader.reset();
+        let mut epoch_loss = 0.0f32;
+        let mut batches = 0usize;
+        while let Some((x, y)) = loader.next_batch(device) {
+            opt.zero_grad();
+            let h1 = layer1.forward(&x).relu();
+            let h2 = layer2.forward(&h1).relu();
+            let logits = layer3.forward(&h2);
+            let loss = logits.nll_loss(&y);
+            epoch_loss += loss.data()[0];
+            batches += 1;
+            loss.backward();
+            opt.step();
+        }
+        if epoch % 100 == 0 || epoch == 1 {
+            let acc = spiral_accuracy(&ds, device, &layer1, &layer2, &layer3);
+            println!("epoch {:04} | loss {:.4} | acc {:.3}", epoch, epoch_loss / batches as f32, acc);
+        }
     }
 
-    gradcheck_log_softmax(Device::Cpu);
-    demo_stability(Device::Cpu);
-    train_xor(Device::Cpu);
+    create_dir_all("out").ok();
+    let mut f_points = File::create("out/spiral_points.csv").unwrap();
+    writeln!(f_points, "x,y,label").unwrap();
+    for i in 0..ds.n {
+        let off = i * ds.dim;
+        writeln!(f_points, "{},{},{}", ds.x[off], ds.x[off + 1], ds.y[i]).unwrap();
+    }
 
-    // train_xor(Device::Cuda); // 目前是佔位符
+    let mut f_grid = File::create("out/spiral_grid.csv").unwrap();
+    writeln!(f_grid, "x,y,p0,p1").unwrap();
+    let (min_x, max_x, min_y, max_y) = dataset_bounds(&ds, 0.3);
+    let mut grid = Vec::new();
+    let mut gx = min_x;
+    while gx <= max_x {
+        let mut gy = min_y;
+        while gy <= max_y {
+            grid.push(gx);
+            grid.push(gy);
+            gy += 0.05;
+        }
+        gx += 0.05;
+    }
+    let rows = grid.len() / 2;
+    let grid_t = Tensor::new_on(&grid, &[rows, 2], device);
+    let probs = layer3.forward(&layer2.forward(&layer1.forward(&grid_t).relu()).relu()).softmax().data();
+    for i in 0..rows {
+        let x = grid[i * 2];
+        let y = grid[i * 2 + 1];
+        let p0 = probs[i * 2];
+        let p1 = probs[i * 2 + 1];
+        writeln!(f_grid, "{},{},{},{}", x, y, p0, p1).unwrap();
+    }
+
+    println!("wrote out/spiral_points.csv and out/spiral_grid.csv");
+}
+
+fn demo_blob_boundary(device: Device) {
+    use std::fs::{create_dir_all, File};
+    use std::io::Write;
+
+    println!("\n=== blob demo on {:?} ===", device);
+    let centers = [(-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let ds = make_blobs(150, 0.25, &centers, 123);
+    let mut loader = DataLoader::new(ds.clone(), 32, true, 7);
+
+    let layer1 = Linear::new_on(2, 32, device);
+    let layer2 = Linear::new_on(32, ds.classes, device);
+    let mut params = Vec::new();
+    params.extend(layer1.parameters());
+    params.extend(layer2.parameters());
+    let opt = SGD::new(params, 0.05);
+
+    let epochs = 400;
+    for epoch in 1..=epochs {
+        loader.reset();
+        let mut epoch_loss = 0.0f32;
+        let mut batches = 0usize;
+        while let Some((x, y)) = loader.next_batch(device) {
+            opt.zero_grad();
+            let h1 = layer1.forward(&x).relu();
+            let logits = layer2.forward(&h1);
+            let loss = logits.nll_loss(&y);
+            epoch_loss += loss.data()[0];
+            batches += 1;
+            loss.backward();
+            opt.step();
+        }
+        if epoch % 100 == 0 || epoch == 1 {
+            let acc = blob_accuracy(&ds, device, &layer1, &layer2);
+            println!("epoch {:04} | loss {:.4} | acc {:.3}", epoch, epoch_loss / batches as f32, acc);
+        }
+    }
+
+    create_dir_all("out").ok();
+    let mut f_points = File::create("out/blob_points.csv").unwrap();
+    writeln!(f_points, "x,y,label").unwrap();
+    for i in 0..ds.n {
+        let off = i * ds.dim;
+        writeln!(f_points, "{},{},{}", ds.x[off], ds.x[off + 1], ds.y[i]).unwrap();
+    }
+
+    let mut f_grid = File::create("out/blob_grid.csv").unwrap();
+    writeln!(f_grid, "x,y,p0,p1,p2").unwrap();
+    let (min_x, max_x, min_y, max_y) = dataset_bounds(&ds, 0.5);
+    let mut grid = Vec::new();
+    let mut gx = min_x;
+    while gx <= max_x {
+        let mut gy = min_y;
+        while gy <= max_y {
+            grid.push(gx);
+            grid.push(gy);
+            gy += 0.05;
+        }
+        gx += 0.05;
+    }
+    let rows = grid.len() / 2;
+    let grid_t = Tensor::new_on(&grid, &[rows, 2], device);
+    let probs = layer2.forward(&layer1.forward(&grid_t).relu()).softmax().data();
+    for i in 0..rows {
+        let x = grid[i * 2];
+        let y = grid[i * 2 + 1];
+        let p0 = probs[i * ds.classes];
+        let p1 = probs[i * ds.classes + 1];
+        let p2 = probs[i * ds.classes + 2];
+        writeln!(f_grid, "{},{},{},{},{}", x, y, p0, p1, p2).unwrap();
+    }
+
+    println!("wrote out/blob_points.csv and out/blob_grid.csv");
+}
+
+fn dataset_bounds(ds: &dataset::Dataset, pad: f32) -> (f32, f32, f32, f32) {
+    let mut min_x = ds.x[0];
+    let mut max_x = ds.x[0];
+    let mut min_y = ds.x[1];
+    let mut max_y = ds.x[1];
+    for i in 0..ds.n {
+        let off = i * ds.dim;
+        let x = ds.x[off];
+        let y = ds.x[off + 1];
+        if x < min_x { min_x = x; }
+        if x > max_x { max_x = x; }
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+    }
+    (min_x - pad, max_x + pad, min_y - pad, max_y + pad)
+}
+
+fn spiral_accuracy(ds: &dataset::Dataset, device: Device, l1: &Linear, l2: &Linear, l3: &Linear) -> f32 {
+    let x = Tensor::new_on(&ds.x, &[ds.n, ds.dim], device);
+    let logits = l3.forward(&l2.forward(&l1.forward(&x).relu()).relu());
+    let probs = logits.softmax().data();
+    let mut correct = 0usize;
+    for i in 0..ds.n {
+        let p0 = probs[i * 2];
+        let p1 = probs[i * 2 + 1];
+        let pred = if p1 > p0 { 1 } else { 0 };
+        if pred == ds.y[i] { correct += 1; }
+    }
+    correct as f32 / ds.n as f32
+}
+
+fn blob_accuracy(ds: &dataset::Dataset, device: Device, l1: &Linear, l2: &Linear) -> f32 {
+    let x = Tensor::new_on(&ds.x, &[ds.n, ds.dim], device);
+    let logits = l2.forward(&l1.forward(&x).relu());
+    let probs = logits.softmax().data();
+    let mut correct = 0usize;
+    for i in 0..ds.n {
+        let mut best = 0usize;
+        let mut best_val = probs[i * ds.classes];
+        for c in 1..ds.classes {
+            let v = probs[i * ds.classes + c];
+            if v > best_val {
+                best_val = v;
+                best = c;
+            }
+        }
+        if best == ds.y[i] { correct += 1; }
+    }
+    correct as f32 / ds.n as f32
 }
