@@ -1,57 +1,92 @@
 # Rutorch
 
-Small Rust autograd/tensor playground with CPU + Metal backends.
+Small Rust autograd/tensor playground with CPU + Metal backends, plus learning demos (XOR, decision boundary, CharGPT).
 
-## 教學範例：數值穩定的 `log_softmax + nll_loss`
+## Features
 
-`softmax -> log -> cross-entropy` 在 logits 很大或很小時，容易發生溢位或 `log(0)`。
-穩定作法是 `log_softmax + nll_loss`，利用 `log-sum-exp` 技巧避免數值爆炸。
+- Autograd on basic tensor ops (CPU + Metal)
+- Stable `log_softmax + nll_loss`
+- Toy datasets (spiral/blob) with CSV outputs
+- CharGPT mini pipeline (RNN/GRU or minimal GPT)
 
-簡短推導：
-
-1. `softmax(z)_i = exp(z_i) / sum_j exp(z_j)`
-2. `log softmax(z)_i = z_i - log(sum_j exp(z_j))`
-3. 為了數值穩定，改寫成  
-   `logsumexp(z) = m + log(sum_j exp(z_j - m))`，其中 `m = max_j z_j`
-4. 所以 `log softmax(z)_i = z_i - logsumexp(z)`
-
-在 `src/main.rs` 內含兩段示範：
-
-1. `gradcheck_log_softmax`：數值微分比對 autograd
-2. `demo_stability`：不穩定寫法 vs 穩定寫法的 loss 對照
-
-執行方式：
+## Quick Start
 
 ```bash
-cargo run
+cargo run --release -- xor
 ```
 
-你會看到類似輸出：
+## Demos
 
-```text
-=== gradcheck: log_softmax on Cpu ===
-max |grad_auto - grad_num| = 0.0000xx
+### XOR
 
-=== stability demo on Cpu ===
-naive (softmax->log): ...
-stable (log_softmax): ...
+```bash
+cargo run --release -- xor
 ```
 
-## 研究/教學方向建議
+### Spiral / Blob Decision Boundary
 
-- 加入更多 `gradcheck` 範例（matmul、relu、broadcast）
-- 讓 demo 能輸出 CSV/圖片，用於講解決策邊界或梯度行為
+```bash
+cargo run --release -- spiral
+cargo run --release -- blob
+```
 
-## Toy Dataset 與 Decision Boundary Demo
+Outputs:
 
-內建 `spiral/moons/circles` 資料產生與簡易 `DataLoader`，示範如何用 CSV 看 decision boundary。
-
-執行後會輸出：
-
-- `out/spiral_points.csv`：資料點與標籤
-- `out/spiral_grid.csv`：網格點與模型預測機率
-
-另提供較簡單的 `blobs` 分群示範：
-
+- `out/spiral_points.csv`
+- `out/spiral_grid.csv`
 - `out/blob_points.csv`
 - `out/blob_grid.csv`
+
+Python plotting (optional):
+
+```bash
+python py/spiral_draw.py
+python py/blob_draw.py
+```
+
+### CharGPT (RNN/GRU)
+
+Train on `data/exp.txt` (math expressions):
+
+```bash
+cargo run --release -- char cpu rnn 80
+cargo run --release -- char cpu gru 80
+```
+
+GPU on macOS:
+
+```bash
+cargo run --release -- char gpu rnn 80
+cargo run --release -- char gpu gru 80
+```
+
+Arguments:
+
+- device: `cpu` | `gpu`
+- model: `rnn` | `gru` | `gpt`
+- epochs: optional integer (default 80)
+
+### CharGPT (GPT)
+
+Minimal single-head causal attention:
+
+```bash
+cargo run --release -- char cpu gpt 20
+```
+
+## Data
+
+`data/exp.txt` contains 1000 recursive math expressions.  
+You can regenerate it if needed.
+
+## Tests
+
+```bash
+cargo test -q
+```
+
+## Notes
+
+- GPU speedups only help when compute is large and CPU↔GPU transfers are minimized.
+- Current RNN/GRU training uses contiguous batch slicing and gradient clipping.
+
