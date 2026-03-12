@@ -111,6 +111,28 @@ pub fn softmax_fw(a: &CpuBuffer, rows: usize, cols: usize) -> CpuBuffer {
     out
 }
 
+pub fn log_softmax_fw(a: &CpuBuffer, rows: usize, cols: usize) -> CpuBuffer {
+    let mut out = CpuBuffer::zeros(a.length);
+    for r in 0..rows {
+        let offset = r * cols;
+        let mut max_val = a.data[offset];
+        for c in 1..cols {
+            if a.data[offset + c] > max_val {
+                max_val = a.data[offset + c];
+            }
+        }
+        let mut sum = 0.0;
+        for c in 0..cols {
+            sum += (a.data[offset + c] - max_val).exp();
+        }
+        let log_sum = sum.ln();
+        for c in 0..cols {
+            out.data[offset + c] = a.data[offset + c] - max_val - log_sum;
+        }
+    }
+    out
+}
+
 pub fn add_broadcast(a: &CpuBuffer, b: &CpuBuffer, cols: usize) -> CpuBuffer {
     let mut out = CpuBuffer::zeros(a.length);
     for i in 0..a.length {
@@ -178,6 +200,22 @@ pub fn softmax_bw(sm_out: &CpuBuffer, grad_out: &CpuBuffer, rows: usize, cols: u
         }
         for c in 0..cols {
            grad_in.data[offset + c] = (grad_out.data[offset + c] - s) * sm_out.data[offset + c];
+        }
+    }
+    grad_in
+}
+
+pub fn log_softmax_bw(log_sm_out: &CpuBuffer, grad_out: &CpuBuffer, rows: usize, cols: usize) -> CpuBuffer {
+    let mut grad_in = CpuBuffer::zeros(log_sm_out.length);
+    for r in 0..rows {
+        let offset = r * cols;
+        let mut sum_grad = 0.0;
+        for c in 0..cols {
+            sum_grad += grad_out.data[offset + c];
+        }
+        for c in 0..cols {
+            let sm = log_sm_out.data[offset + c].exp();
+            grad_in.data[offset + c] = grad_out.data[offset + c] - sm * sum_grad;
         }
     }
     grad_in

@@ -26,6 +26,7 @@ pub enum Op {
     Pow(Tensor, f32),   // 次方
     Log(Tensor),        // 對數
     Softmax(Tensor),    // Softmax
+    LogSoftmax(Tensor), // Log-Softmax
     AddBroadcast(Tensor, Tensor), // 廣播加法
 }
 
@@ -162,6 +163,16 @@ impl Tensor {
         })))
     }
 
+    pub fn log_softmax(&self) -> Tensor {
+        let shape = self.shape();
+        let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, shape[0]) };
+        let storage = self.0.borrow().data.log_softmax_fw(rows, cols);
+        Self(Rc::new(RefCell::new(TensorInner {
+            data: storage, grad: Storage::zeros(rows * cols, self.device()),
+            shape: self.shape(), op: Op::LogSoftmax(self.clone()), device: self.device()
+        })))
+    }
+
     pub fn neg(&self) -> Tensor {
         let len = self.0.borrow().data.length();
         let neg_ones = Tensor::new_on(&vec![-1.0; len], &self.shape(), self.device());
@@ -178,6 +189,13 @@ impl Tensor {
 
     pub fn cross_entropy(&self, yb: &Tensor) -> Tensor {
         let log_probs = self.log();
+        let zb = yb.mul(&log_probs);
+        zb.sum().neg()
+    }
+
+    /// 穩定版 NLL loss：logits -> log_softmax -> -sum(y * log_probs)
+    pub fn nll_loss(&self, yb: &Tensor) -> Tensor {
+        let log_probs = self.log_softmax();
         let zb = yb.mul(&log_probs);
         zb.sum().neg()
     }
@@ -200,7 +218,7 @@ impl Tensor {
                 visited.insert(v.clone());
                 match &v.0.borrow().op {
                     Op::Add(a, b) | Op::Mul(a, b) | Op::Matmul(a, b) | Op::AddBroadcast(a, b) => { build_topo(a, visited, topo); build_topo(b, visited, topo); }
-                    Op::Relu(a) | Op::Sum(a) | Op::Pow(a, _) | Op::Log(a) | Op::Softmax(a) => { build_topo(a, visited, topo); }
+                    Op::Relu(a) | Op::Sum(a) | Op::Pow(a, _) | Op::Log(a) | Op::Softmax(a) | Op::LogSoftmax(a) => { build_topo(a, visited, topo); }
                     Op::Leaf => {}
                 }
                 topo.push(v.clone());
@@ -260,6 +278,11 @@ impl Tensor {
                     let shape = a.shape();
                     let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, shape[0]) };
                     inner.data.softmax_bw(&grad, &mut a.0.borrow_mut().grad, rows, cols);
+                }
+                Op::LogSoftmax(a) => {
+                    let shape = a.shape();
+                    let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, shape[0]) };
+                    inner.data.log_softmax_bw(&grad, &mut a.0.borrow_mut().grad, rows, cols);
                 }
                 Op::AddBroadcast(a, b) => {
                     a.0.borrow_mut().grad.add_assign(&grad);

@@ -162,6 +162,15 @@ impl Storage {
         }
     }
 
+    pub fn log_softmax_fw(&self, rows: usize, cols: usize) -> Self {
+        match self {
+            Storage::Cpu(a) => Storage::Cpu(cpu::log_softmax_fw(a, rows, cols)),
+            #[cfg(target_os = "macos")]
+            Storage::Metal(a) => Storage::Metal(metal::log_softmax_fw(a, rows, cols)),
+            Storage::Cuda(a) => Storage::Cuda(cuda::log_softmax_fw(a, rows, cols)),
+        }
+    }
+
     pub fn add_broadcast(&self, b: &Self, cols: usize) -> Self {
         match (self, b) {
             (Storage::Cpu(a), Storage::Cpu(b_)) => Storage::Cpu(cpu::add_broadcast(a, b_, cols)),
@@ -240,6 +249,19 @@ impl Storage {
             #[cfg(target_os = "macos")]
             (Storage::Metal(sm), Storage::Metal(go), Storage::Metal(tg)) => metal::softmax_bw(sm, go, tg, rows, cols),
             (Storage::Cuda(_sm), Storage::Cuda(_go), Storage::Cuda(_tg)) => unimplemented!(),
+            _ => panic!("Backend mismatch"),
+        }
+    }
+
+    pub fn log_softmax_bw(&self, grad_out: &Self, target_grad: &mut Self, rows: usize, cols: usize) {
+        match (self, grad_out, target_grad) {
+            (Storage::Cpu(lsm), Storage::Cpu(go), Storage::Cpu(tg)) => {
+                let bw = cpu::log_softmax_bw(lsm, go, rows, cols);
+                cpu::add_assign(tg, &bw);
+            },
+            #[cfg(target_os = "macos")]
+            (Storage::Metal(lsm), Storage::Metal(go), Storage::Metal(tg)) => metal::log_softmax_bw(lsm, go, tg, rows, cols),
+            (Storage::Cuda(_lsm), Storage::Cuda(_go), Storage::Cuda(_tg)) => unimplemented!(),
             _ => panic!("Backend mismatch"),
         }
     }

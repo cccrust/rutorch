@@ -80,6 +80,31 @@ kernel void softmax_bw(device const float* sm_out [[buffer(0)]], device const fl
     for (uint i = 0; i < cols; ++i) { target_grad[offset + i] += (grad_out[offset + i] - s) * sm_out[offset + i]; }
 }
 
+// === 新增：Log-Softmax (2D) ===
+kernel void log_softmax_fw(device const float* in [[buffer(0)]], device float* out [[buffer(1)]], constant uint& cols [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    uint offset = id * cols;
+    float max_val = in[offset];
+    for (uint i = 1; i < cols; ++i) { max_val = max(max_val, in[offset + i]); }
+
+    float sum = 0.0;
+    for (uint i = 0; i < cols; ++i) { sum += exp(in[offset + i] - max_val); }
+    float log_sum = log(sum);
+
+    for (uint i = 0; i < cols; ++i) {
+        out[offset + i] = in[offset + i] - max_val - log_sum;
+    }
+}
+
+kernel void log_softmax_bw(device const float* log_sm_out [[buffer(0)]], device const float* grad_out [[buffer(1)]], device float* target_grad [[buffer(2)]], constant uint& cols [[buffer(3)]], uint id [[thread_position_in_grid]]) {
+    uint offset = id * cols;
+    float sum_grad = 0.0;
+    for (uint i = 0; i < cols; ++i) { sum_grad += grad_out[offset + i]; }
+    for (uint i = 0; i < cols; ++i) {
+        float sm = exp(log_sm_out[offset + i]);
+        target_grad[offset + i] += grad_out[offset + i] - sm * sum_grad;
+    }
+}
+
 // === 新增：優化器與梯度管理 ===
 
 // 清空梯度 (設為 0)
@@ -287,6 +312,12 @@ pub fn softmax_fw(a: &GpuBuffer, rows: usize, cols: usize) -> GpuBuffer {
     out
 }
 
+pub fn log_softmax_fw(a: &GpuBuffer, rows: usize, cols: usize) -> GpuBuffer {
+    let out = GpuBuffer::zeros(rows * cols);
+    dispatch_1d_with_u32("log_softmax_fw", &[&a.buffer, &out.buffer], rows, cols as u32);
+    out
+}
+
 pub fn add_broadcast(a: &GpuBuffer, b: &GpuBuffer, cols: usize) -> GpuBuffer {
     let out = GpuBuffer::zeros(a.length);
     dispatch_1d_with_u32("add_broadcast", &[&a.buffer, &b.buffer, &out.buffer], a.length, cols as u32);
@@ -331,6 +362,10 @@ pub fn softmax_bw(sm_out: &GpuBuffer, grad_out: &GpuBuffer, target_grad: &mut Gp
     dispatch_1d_with_u32("softmax_bw", &[&sm_out.buffer, &grad_out.buffer, &target_grad.buffer], rows, cols as u32);
 }
 
+pub fn log_softmax_bw(log_sm_out: &GpuBuffer, grad_out: &GpuBuffer, target_grad: &mut GpuBuffer, rows: usize, cols: usize) {
+    dispatch_1d_with_u32("log_softmax_bw", &[&log_sm_out.buffer, &grad_out.buffer, &target_grad.buffer], rows, cols as u32);
+}
+
 pub fn add_broadcast_bw_b(grad_out: &GpuBuffer, grad_b: &mut GpuBuffer, rows: usize, cols: usize) {
     dispatch_1d_with_2_u32("add_broadcast_bw_b", &[&grad_out.buffer, &grad_b.buffer], cols, rows as u32, cols as u32);
 }
@@ -342,4 +377,3 @@ pub fn zero_grad(grad: &mut GpuBuffer) {
 pub fn sgd_step(param: &mut GpuBuffer, grad: &GpuBuffer, lr: f32) {
     dispatch_1d_with_f32("sgd_step", &[&param.buffer, &grad.buffer], param.length, lr);
 }
-
